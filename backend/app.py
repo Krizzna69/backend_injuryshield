@@ -11,7 +11,7 @@ app.secret_key = "running_injury_analysis_secret_key"
 CORS(app)  # Enable CORS for all routes
 
 # Configure upload and results folders
-BASE_DIR = r"C:/Users/jaswa/PycharmProjects/sportswithreact/backend/static"
+BASE_DIR = r"backend/static"
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 RESULTS_FOLDER = os.path.join(BASE_DIR, 'results')
 ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm'}
