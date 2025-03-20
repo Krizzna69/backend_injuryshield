@@ -7,6 +7,4 @@ mediapipe
 pandas
 matplotlib
 uuid
-re
-os
 warnings
