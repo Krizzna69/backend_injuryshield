@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: sport-form-analyzer
+    env: python
+    plan: starter # Use at least the starter plan
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --config gunicorn_config.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.0
+    scaling:
+      minInstances: 1
+      maxInstances: 1

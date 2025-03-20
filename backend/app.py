@@ -1,10 +1,17 @@
 import os
 import uuid
 import re
+import threading
+import queue
+import time
 from flask import Flask, request, jsonify, send_from_directory, send_file, Response
 from werkzeug.utils import secure_filename
 import analysis
 from flask_cors import CORS
+
+# Create a custom task queue for processing videos
+processing_queue = queue.Queue(maxsize=10)
+processing_status = {}  # Track processing status
 
 app = Flask(__name__, static_folder='static')
 app.secret_key = "running_injury_analysis_secret_key"
@@ -18,11 +25,75 @@ ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm'}
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['RESULTS_FOLDER'] = RESULTS_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload size
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # Reduced to 200MB max upload size
 
 # Create required directories if they don't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULTS_FOLDER, exist_ok=True)
+
+
+# Worker thread function to process videos asynchronously
+def process_video_worker():
+    """Worker thread to process videos from the queue"""
+    print("Starting worker thread")
+    while True:
+        try:
+            # Get job from queue with a timeout to allow checks
+            try:
+                job = processing_queue.get(timeout=1)
+            except queue.Empty:
+                # No job available, just continue the loop
+                continue
+
+            if job is None:  # None is a signal to stop the thread
+                break
+
+            video_path, analysis_dir, analysis_id, quality = job
+
+            # Update status
+            processing_status[analysis_id] = {"status": "processing", "progress": 0}
+
+            try:
+                # Process the video
+                print(f"Processing video for analysis ID: {analysis_id}")
+                result, risk_scores, frame_indices = analysis.analyze_running_form(
+                    video_path, analysis_dir, quality=quality)
+
+                # Save risk plot
+                plot_path = analysis.save_risk_plot(risk_scores, analysis_dir)
+
+                # Save report
+                report_path = analysis.save_report(result, analysis_dir)
+
+                # Update status
+                processing_status[analysis_id] = {"status": "completed", "progress": 100}
+
+                print(f"Processing completed for analysis ID: {analysis_id}")
+
+                # Clean up original video to save space
+                try:
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                except Exception as e:
+                    print(f"Error removing video: {e}")
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                processing_status[analysis_id] = {"status": "error", "error": str(e)}
+                print(f"Processing error for analysis ID {analysis_id}: {e}")
+
+        except Exception as e:
+            print(f"Error in worker thread: {e}")
+        finally:
+            # Mark task as done regardless of outcome
+            if 'job' in locals() and job is not None:
+                processing_queue.task_done()
+
+
+# Start worker thread
+worker_thread = threading.Thread(target=process_video_worker, daemon=True)
+worker_thread.start()
 
 
 def allowed_file(filename):
@@ -33,17 +104,21 @@ def allowed_file(filename):
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint"""
-    return jsonify({'status': 'healthy'})
+    return jsonify({
+        'status': 'healthy',
+        'queue_size': processing_queue.qsize(),
+        'active_jobs': len(processing_status)
+    })
 
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    """API endpoint for uploading videos and analyzing running form"""
+    """API endpoint for uploading videos and queuing for analysis"""
     if 'video' not in request.files:
         return jsonify({'error': 'No file part'}), 400
 
     file = request.files['video']
-    quality = request.form.get('quality', 'medium')  # Get quality setting
+    quality = request.form.get('quality', 'low')  # Default to low quality for speed
 
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
@@ -60,20 +135,15 @@ def upload_file():
             video_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(video_path)
 
-            # Run analysis with specified quality
-            result, risk_scores, frame_indices = analysis.analyze_running_form(
-                video_path, analysis_dir, quality=quality)
+            # Queue the video for processing instead of processing immediately
+            processing_queue.put((video_path, analysis_dir, analysis_id, quality))
 
-            # Save risk plot
-            plot_path = analysis.save_risk_plot(risk_scores, analysis_dir)
+            # Set initial status
+            processing_status[analysis_id] = {"status": "queued", "progress": 0}
 
-            # Save report
-            report_path = analysis.save_report(result, analysis_dir)
+            print(f"Video queued for analysis, ID: {analysis_id}")
 
-            # Delete original video to save space
-            os.remove(video_path)
-
-            # Return the analysis ID
+            # Return the analysis ID immediately
             return jsonify({'success': True, 'analysis_id': analysis_id})
 
         except Exception as e:
@@ -84,6 +154,22 @@ def upload_file():
         return jsonify({
             'error': 'File type not allowed. Please upload a video file (mp4, mov, avi, mkv, webm).'
         }), 400
+
+
+@app.route('/api/status/<analysis_id>', methods=['GET'])
+def check_status(analysis_id):
+    """Check the status of video processing"""
+    if analysis_id in processing_status:
+        return jsonify(processing_status[analysis_id])
+    else:
+        # Check if the results already exist (processing completed)
+        analysis_dir = os.path.join(app.config['RESULTS_FOLDER'], analysis_id)
+        report_file = os.path.join(analysis_dir, 'analysis_report.txt')
+
+        if os.path.exists(report_file):
+            return jsonify({"status": "completed", "progress": 100})
+
+        return jsonify({"status": "not_found"}), 404
 
 
 @app.route('/api/results/<analysis_id>', methods=['GET'])
@@ -99,6 +185,12 @@ def get_analysis_results(analysis_id):
         # Get the report file
         report_file = os.path.join(analysis_dir, 'analysis_report.txt')
         if not os.path.exists(report_file):
+            # Check if it's still processing
+            if analysis_id in processing_status:
+                return jsonify({
+                    'status': 'processing',
+                    'progress': processing_status[analysis_id].get('progress', 0)
+                }), 202
             return jsonify({'error': 'Analysis report not found'}), 404
 
         # Parse the report
@@ -156,15 +248,6 @@ def get_analysis_results(analysis_id):
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-    # Print debug information
-    print(f"Sending file: {file_path}")
-
-    try:
-        return send_from_directory(analysis_dir, filename, as_attachment=True)
-    except Exception as e:
-        print(f"Error sending file: {e}")
-        return jsonify({'error': f'Error serving file: {str(e)}'}), 500
-
 
 @app.route('/api/files/<analysis_id>', methods=['GET'])
 def list_analysis_files(analysis_id):
@@ -198,9 +281,18 @@ def list_analysis_files(analysis_id):
 def stream_video(analysis_id):
     """Stream video with proper support for range requests"""
     analysis_dir = os.path.join(app.config['RESULTS_FOLDER'], analysis_id)
-    video_path = os.path.join(analysis_dir, 'analyzed_video.mp4')
 
-    if not os.path.exists(video_path):
+    # Try multiple possible filenames for the video
+    possible_filenames = ['analyzed_video.mp4', 'compressed_video.mp4', 'video.mp4']
+
+    video_path = None
+    for fname in possible_filenames:
+        path = os.path.join(analysis_dir, fname)
+        if os.path.exists(path):
+            video_path = path
+            break
+
+    if not video_path:
         return jsonify({'error': 'Video not found'}), 404
 
     file_size = os.path.getsize(video_path)
@@ -225,6 +317,12 @@ def stream_video(analysis_id):
         byte2 = file_size - 1
 
     length = byte2 - byte1 + 1
+
+    # For large ranges, limit chunk size to avoid memory issues
+    max_chunk = 1024 * 1024  # 1MB max chunk
+    if length > max_chunk:
+        byte2 = byte1 + max_chunk - 1
+        length = max_chunk
 
     # Read the specified byte range
     with open(video_path, 'rb') as f:
@@ -322,6 +420,20 @@ def serve_react_app(path):
         # If the file doesn't exist, serve React's index.html
         return send_from_directory(os.path.join(app.static_folder, 'react'), 'index.html')
 
+
+# Clean up on app exit
+def cleanup():
+    """Cleanup function to be called when the app exits"""
+    processing_queue.put(None)  # Signal worker thread to stop
+    if worker_thread.is_alive():
+        worker_thread.join(timeout=1.0)
+    print("Cleanup complete")
+
+
+# Register cleanup handler
+import atexit
+
+atexit.register(cleanup)
 
 if __name__ == '__main__':
     app.run(debug=True)
