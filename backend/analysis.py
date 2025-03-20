@@ -7,7 +7,6 @@ import matplotlib
 # Use Agg backend to avoid display issues on servers
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
 import os
 import warnings
 
