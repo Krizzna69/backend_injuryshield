@@ -4,4 +4,4 @@ opencv-python
 mediapipe
 matplotlib
 protobuf
-gunicorng
+gunicorn
